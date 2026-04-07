@@ -84,12 +84,10 @@ async def lol_tier(riot_id: str = Path(...)):
         account = await _get_account(session, riot_id)
         puuid = account["puuid"]
 
-        # summoner ID
         url = f"{settings.LOL_BASE_URL}/lol/summoner/v4/summoners/by-puuid/{puuid}"
         async with session.get(url, headers=_riot_headers()) as resp:
             summoner = await resp.json()
 
-        # ranked
         url = f"{settings.LOL_BASE_URL}/lol/league/v4/entries/by-summoner/{summoner['id']}"
         async with session.get(url, headers=_riot_headers()) as resp:
             entries = await resp.json()
