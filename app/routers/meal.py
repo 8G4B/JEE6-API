@@ -1,5 +1,6 @@
 import logging
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Query
 import aiohttp
 from app.config import settings
@@ -32,6 +33,7 @@ async def _fetch_meals(from_ymd: str, to_ymd: str) -> list[dict]:
     params = {
         "key": settings.MEAL_API_KEY,
         "type": "json",
+        "pSize": 100,
         "ATPT_OFCDC_SC_CODE": settings.ATPT_OFCDC_SC_CODE,
         "SD_SCHUL_CODE": settings.SD_SCHUL_CODE,
         "MLSV_FROM_YMD": from_ymd,
@@ -72,7 +74,7 @@ async def get_meal(
     meal_type: str = Query("auto", regex="^(auto|breakfast|lunch|dinner)$"),
     day: str = Query("today", regex="^(today|tomorrow)$"),
 ):
-    now = datetime.now()
+    now = datetime.now(ZoneInfo("Asia/Seoul"))
 
     if day == "tomorrow":
         target = now + timedelta(days=1)
