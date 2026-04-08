@@ -7,7 +7,7 @@ from app import cache
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-CACHE_TTL = 600  # 10분
+CACHE_TTL = 600
 
 
 @router.get("/")
@@ -22,16 +22,31 @@ async def get_water_temp():
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 data = await resp.json(content_type=None)
 
-        rows = data.get("WPOSInformationTime", {}).get("row", [])
+        if "WPOSInformationTime" not in data:
+            return {"error": "데이터 없음"}
+
+        rows = data["WPOSInformationTime"].get("row", [])
         if not rows:
             return {"error": "데이터 없음"}
 
-        target = next((r for r in rows if "선유" in r.get("SITE_ID", "")), rows[0])
+        target = None
+        for row in rows:
+            if row.get("MSRSTN_NM") == "선유":
+                target = row
+                break
+        if not target:
+            target = rows[0]
+
+        msr_time = target.get("HR", "00:00")
+        if ":" in msr_time:
+            hour, minute = msr_time.split(":")
+        else:
+            hour, minute = "00", "00"
 
         result = {
-            "hour": target.get("MSR_TIME", "00")[:2],
-            "minute": target.get("MSR_TIME", "0000")[2:4],
-            "temp": target.get("W_TEMP", "?"),
+            "hour": hour,
+            "minute": minute,
+            "temp": target.get("WATT", "0.0"),
         }
 
         await cache.set("water:temp", result, ttl=CACHE_TTL)

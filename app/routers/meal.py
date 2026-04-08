@@ -8,27 +8,23 @@ from app import cache
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-CACHE_TTL = 3600 * 6  # 6시간
+CACHE_TTL = 3600 * 6
 
-MEAL_TIMES = {
-    "breakfast": (0, 8, 20),
-    "lunch": (8, 20, 13, 30),
-    "dinner": (13, 30, 19, 30),
-}
+NO_MEAL = "급식이 없습니다."
+
+MEAL_TIMES = [
+    (lambda h, m: h < 7 or (h == 7 and m < 30), "1", "🍳 아침"),
+    (lambda h, m: h < 12 or (h == 12 and m < 30), "2", "🍚 점심"),
+    (lambda h, m: h < 18 or (h == 18 and m < 30), "3", "🍖 저녁"),
+]
 
 
 def _detect_meal_type(now: datetime) -> tuple[str, str]:
     h, m = now.hour, now.minute
-    t = h * 60 + m
-    if t < 8 * 60 + 20:
-        return "1", "🍳 아침"
-    elif t < 13 * 60 + 30:
-        return "2", "🍚 점심"
-    elif t < 19 * 60 + 30:
-        return "3", "🍖 저녁"
-    else:
-        tomorrow = now + timedelta(days=1)
-        return "1", f"🍳 내일 아침"
+    for time_check, code, title in MEAL_TIMES:
+        if time_check(h, m):
+            return code, title
+    return "1", "🍳 내일 아침"
 
 
 async def _fetch_meals(from_ymd: str, to_ymd: str) -> list[dict]:
@@ -54,18 +50,20 @@ async def _fetch_meals(from_ymd: str, to_ymd: str) -> list[dict]:
         return []
 
 
-def _format_meal(row: dict) -> dict:
-    menu = row.get("DDISH_NM", "").replace("<br/>", "\n")
-    menu = "\n".join(
-        item.strip().split("(")[0].strip()
-        for item in menu.split("\n")
-        if item.strip()
+def _format_menu(raw: str) -> str:
+    return "\n".join(
+        f"- {dish.strip()}"
+        for dish in raw.replace("*", "").split("<br/>")
+        if dish.strip()
     )
+
+
+def _format_meal(row: dict) -> dict:
     return {
         "date": row.get("MLSV_YMD", ""),
         "meal_code": row.get("MMEAL_SC_CODE", ""),
-        "menu": menu,
-        "cal_info": row.get("CAL_INFO", ""),
+        "menu": _format_menu(row.get("DDISH_NM", "")),
+        "cal_info": row.get("CAL_INFO", "").strip(),
     }
 
 
@@ -83,11 +81,9 @@ async def get_meal(
 
     date_str = target.strftime("%Y%m%d")
 
-    # 주간 캐시 키
     monday = target - timedelta(days=target.weekday())
     week_key = f"meal:{monday.strftime('%Y%m%d')}"
 
-    # 캐시 조회
     cached = await cache.get(week_key)
     if not cached:
         from_ymd = monday.strftime("%Y%m%d")
@@ -97,9 +93,18 @@ async def get_meal(
         if cached:
             await cache.set(week_key, cached, ttl=CACHE_TTL)
 
-    # meal_type 결정
     if meal_type == "auto":
-        code, title = _detect_meal_type(now if day == "today" else target)
+        if day == "today":
+            code, title = _detect_meal_type(now)
+            if code == "1" and title == "🍳 내일 아침":
+                tomorrow = now + timedelta(days=1)
+                tomorrow_str = tomorrow.strftime("%Y%m%d")
+                for m in (cached or []):
+                    if m["date"] == tomorrow_str and m["meal_code"] == "1":
+                        return {"title": title, "menu": m["menu"], "cal_info": m["cal_info"]}
+                return {"title": title, "menu": NO_MEAL, "cal_info": ""}
+        else:
+            code, title = "1", "🍳 내일 아침"
     else:
         code_map = {"breakfast": "1", "lunch": "2", "dinner": "3"}
         title_map = {
@@ -108,13 +113,16 @@ async def get_meal(
             "dinner": "🍖 저녁",
         }
         if day == "tomorrow":
-            title_map = {k: f"{v.split()[0]} 내일 {v.split()[1]}" for k, v in title_map.items()}
+            title_map = {
+                "breakfast": "🍳 내일 아침",
+                "lunch": "🍚 내일 점심",
+                "dinner": "🍖 내일 저녁",
+            }
         code = code_map[meal_type]
         title = title_map[meal_type]
 
-    # 해당 날짜+코드 필터
     for m in (cached or []):
         if m["date"] == date_str and m["meal_code"] == code:
             return {"title": title, "menu": m["menu"], "cal_info": m["cal_info"]}
 
-    return {"title": title, "menu": "급식이 없습니다.", "cal_info": ""}
+    return {"title": title, "menu": NO_MEAL, "cal_info": ""}
