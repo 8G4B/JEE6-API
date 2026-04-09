@@ -29,27 +29,43 @@ def _detect_meal_type(now: datetime) -> tuple[str, str]:
 
 
 async def _fetch_meals(from_ymd: str, to_ymd: str) -> list[dict]:
+    if not settings.MEAL_API_KEY:
+        logger.warning("MEAL_API_KEY가 없습니다. NEIS API가 pSize=5로 제한됩니다.")
+
     url = settings.MEAL_API_BASE_URL
-    params = {
-        "key": settings.MEAL_API_KEY,
-        "type": "json",
-        "pSize": 100,
-        "ATPT_OFCDC_SC_CODE": settings.ATPT_OFCDC_SC_CODE,
-        "SD_SCHUL_CODE": settings.SD_SCHUL_CODE,
-        "MLSV_FROM_YMD": from_ymd,
-        "MLSV_TO_YMD": to_ymd,
-    }
+    all_rows = []
+    page = 1
+
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                data = await resp.json(content_type=None)
-                rows = data.get("mealServiceDietInfo", [{}])
-                if len(rows) < 2:
-                    return []
-                return rows[1].get("row", [])
+            while True:
+                params = {
+                    "key": settings.MEAL_API_KEY,
+                    "type": "json",
+                    "pIndex": page,
+                    "pSize": 100,
+                    "ATPT_OFCDC_SC_CODE": settings.ATPT_OFCDC_SC_CODE,
+                    "SD_SCHUL_CODE": settings.SD_SCHUL_CODE,
+                    "MLSV_FROM_YMD": from_ymd,
+                    "MLSV_TO_YMD": to_ymd,
+                }
+                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    data = await resp.json(content_type=None)
+                    info = data.get("mealServiceDietInfo", [{}])
+                    if len(info) < 2:
+                        break
+
+                    rows = info[1].get("row", [])
+                    all_rows.extend(rows)
+
+                    total_count = info[0].get("head", [{}])[0].get("list_total_count", 0)
+                    if len(all_rows) >= total_count:
+                        break
+                    page += 1
     except Exception as e:
         logger.error(f"급식 API 오류: {e}")
-        return []
+
+    return all_rows
 
 
 def _format_menu(raw: str) -> str:
