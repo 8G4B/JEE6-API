@@ -98,14 +98,29 @@ def _meal_response(
     return resp
 
 
+def _error_response(message: str) -> dict:
+    return {"title": "❗ 오류", "menu": "", "cal_info": "", "error": message}
+
+
 @router.get("/")
 async def get_meal(
     meal_type: str = Query("auto", regex="^(auto|breakfast|lunch|dinner)$"),
     day: str = Query("today", regex="^(today|tomorrow)$"),
+    date: str | None = Query(None, regex="^[0-9]{8}$"),
 ):
     now = datetime.now(ZoneInfo("Asia/Seoul"))
 
-    if day == "tomorrow":
+    # date(YYYYMMDD)가 오면 day보다 우선한다. 올해 날짜만 허용.
+    if date is not None:
+        if date[:4] != f"{now.year}":
+            return _error_response(f"올해({now.year}년) 날짜만 조회할 수 있어요.")
+        try:
+            target = datetime.strptime(date, "%Y%m%d").replace(
+                tzinfo=ZoneInfo("Asia/Seoul")
+            )
+        except ValueError:
+            return _error_response("올바르지 않은 날짜예요.")
+    elif day == "tomorrow":
         target = now + timedelta(days=1)
     else:
         target = now
@@ -125,9 +140,12 @@ async def get_meal(
             await cache.set(week_key, cached, ttl=CACHE_TTL)
 
     if meal_type == "auto":
-        if day == "today":
+        if date is None and day == "tomorrow":
+            code, title = "1", "🍳 내일 아침"
+        else:
             code, title = _detect_meal_type(now)
-            if code == "1" and title == "🍳 내일 아침":
+            # 오늘(날짜 미지정) + 저녁 이후 → 내일 아침으로 롤오버 (기존 동작 유지)
+            if date is None and code == "1" and title == "🍳 내일 아침":
                 tomorrow = now + timedelta(days=1)
                 tomorrow_str = tomorrow.strftime("%Y%m%d")
                 for m in (cached or []):
@@ -136,23 +154,29 @@ async def get_meal(
                             title, m["menu"], m["cal_info"], tomorrow_str, "1"
                         )
                 return _meal_response(title, NO_MEAL, "")
-        else:
-            code, title = "1", "🍳 내일 아침"
+            # 날짜를 지정했는데 '내일 아침'으로 잡히면 그냥 '아침'으로 표기
+            if date is not None and title == "🍳 내일 아침":
+                code, title = "1", "🍳 아침"
     else:
         code_map = {"breakfast": "1", "lunch": "2", "dinner": "3"}
-        title_map = {
-            "breakfast": "🍳 아침",
-            "lunch": "🍚 점심",
-            "dinner": "🍖 저녁",
-        }
-        if day == "tomorrow":
+        if date is None and day == "tomorrow":
             title_map = {
                 "breakfast": "🍳 내일 아침",
                 "lunch": "🍚 내일 점심",
                 "dinner": "🍖 내일 저녁",
             }
+        else:
+            title_map = {
+                "breakfast": "🍳 아침",
+                "lunch": "🍚 점심",
+                "dinner": "🍖 저녁",
+            }
         code = code_map[meal_type]
         title = title_map[meal_type]
+
+    # 날짜를 직접 지정한 경우 제목에 날짜를 덧붙여 명확히 한다.
+    if date is not None:
+        title = f"{title} ({target.month}/{target.day})"
 
     for m in (cached or []):
         if m["date"] == date_str and m["meal_code"] == code:
