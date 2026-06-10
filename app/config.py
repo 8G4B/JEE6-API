@@ -9,6 +9,9 @@ class Settings:
     ATPT_OFCDC_SC_CODE = os.getenv("ATPT_OFCDC_SC_CODE", "F10")
     SD_SCHUL_CODE = os.getenv("SD_SCHUL_CODE", "7380292")
 
+    MEAL_IMAGE_BASE_URL = os.getenv("MEAL_IMAGE_BASE_URL", "http://gsm.gen.hs.kr")
+    MEAL_IMAGE_TBNUM = os.getenv("MEAL_IMAGE_TBNUM", "42")
+
     SEOUL_DATA_API_KEY = os.getenv("SEOUL_DATA_API_KEY", "sample")
     WATER_API_BASE_URL = "http://openapi.seoul.go.kr:8088"
 

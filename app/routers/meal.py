@@ -5,6 +5,7 @@ from fastapi import APIRouter, Query
 import aiohttp
 from app.config import settings
 from app import cache
+from app.meal_images import get_meal_image
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -85,6 +86,17 @@ def _format_meal(row: dict) -> dict:
     }
 
 
+async def _meal_response(
+    title: str, menu: str, cal_info: str, date_str: str = "", code: str = ""
+) -> dict:
+    resp = {"title": title, "menu": menu, "cal_info": cal_info}
+    if menu != NO_MEAL and date_str and code:
+        image_url = await get_meal_image(date_str, code)
+        if image_url:
+            resp["image_url"] = image_url
+    return resp
+
+
 @router.get("/")
 async def get_meal(
     meal_type: str = Query("auto", regex="^(auto|breakfast|lunch|dinner)$"),
@@ -119,8 +131,10 @@ async def get_meal(
                 tomorrow_str = tomorrow.strftime("%Y%m%d")
                 for m in (cached or []):
                     if m["date"] == tomorrow_str and m["meal_code"] == "1":
-                        return {"title": title, "menu": m["menu"], "cal_info": m["cal_info"]}
-                return {"title": title, "menu": NO_MEAL, "cal_info": ""}
+                        return await _meal_response(
+                            title, m["menu"], m["cal_info"], tomorrow_str, "1"
+                        )
+                return await _meal_response(title, NO_MEAL, "")
         else:
             code, title = "1", "🍳 내일 아침"
     else:
@@ -141,6 +155,8 @@ async def get_meal(
 
     for m in (cached or []):
         if m["date"] == date_str and m["meal_code"] == code:
-            return {"title": title, "menu": m["menu"], "cal_info": m["cal_info"]}
+            return await _meal_response(
+                title, m["menu"], m["cal_info"], date_str, code
+            )
 
-    return {"title": title, "menu": NO_MEAL, "cal_info": ""}
+    return await _meal_response(title, NO_MEAL, "")
