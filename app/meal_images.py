@@ -1,12 +1,17 @@
 import logging
 import re
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import aiohttp
 from app.config import settings
 from app import cache
 
 logger = logging.getLogger(__name__)
 
-CACHE_TTL = 3600 * 6
+# 지난 달 사진은 더 이상 바뀌지 않으므로 아주 길게 캐싱한다.
+# 이번 달(미래 포함)은 사진이 계속 올라오므로 짧게 잡아 새 사진을 반영한다.
+CACHE_TTL_PAST = 3600 * 24 * 30
+CACHE_TTL_CURRENT = 3600
 _HEADERS = {"User-Agent": "Mozilla/5.0"}
 _DAY_RE = re.compile(r'<div class="day_num">(\d+)<')
 _IMG_RE = re.compile(r"imgOpen\('([^']*?_(\d)_middle_thumb\.[a-zA-Z]+)'")
@@ -47,6 +52,13 @@ async def _fetch_month_images(year: int, month: int) -> dict:
     return result
 
 
+def _ttl_for(year: int, month: int) -> int:
+    now = datetime.now(ZoneInfo("Asia/Seoul"))
+    if (year, month) < (now.year, now.month):
+        return CACHE_TTL_PAST
+    return CACHE_TTL_CURRENT
+
+
 async def get_meal_image(date_str: str, meal_code: str) -> str | None:
     year, month = int(date_str[:4]), int(date_str[4:6])
     cache_key = f"meal_img:{date_str[:6]}"
@@ -55,6 +67,6 @@ async def get_meal_image(date_str: str, meal_code: str) -> str | None:
     if images is None:
         images = await _fetch_month_images(year, month)
         if images:
-            await cache.set(cache_key, images, ttl=CACHE_TTL)
+            await cache.set(cache_key, images, ttl=_ttl_for(year, month))
 
     return (images or {}).get(date_str, {}).get(meal_code)

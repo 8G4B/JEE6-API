@@ -86,14 +86,15 @@ def _format_meal(row: dict) -> dict:
     }
 
 
-async def _meal_response(
+def _meal_response(
     title: str, menu: str, cal_info: str, date_str: str = "", code: str = ""
 ) -> dict:
+    # 사진은 여기서 가져오지 않는다. date/meal_code만 실어 보내고,
+    # 클라이언트가 /meal/image 로 따로 받아 메시지를 수정해 붙이도록 한다.
     resp = {"title": title, "menu": menu, "cal_info": cal_info}
     if menu != NO_MEAL and date_str and code:
-        image_url = await get_meal_image(date_str, code)
-        if image_url:
-            resp["image_url"] = image_url
+        resp["date"] = date_str
+        resp["meal_code"] = code
     return resp
 
 
@@ -131,10 +132,10 @@ async def get_meal(
                 tomorrow_str = tomorrow.strftime("%Y%m%d")
                 for m in (cached or []):
                     if m["date"] == tomorrow_str and m["meal_code"] == "1":
-                        return await _meal_response(
+                        return _meal_response(
                             title, m["menu"], m["cal_info"], tomorrow_str, "1"
                         )
-                return await _meal_response(title, NO_MEAL, "")
+                return _meal_response(title, NO_MEAL, "")
         else:
             code, title = "1", "🍳 내일 아침"
     else:
@@ -155,8 +156,14 @@ async def get_meal(
 
     for m in (cached or []):
         if m["date"] == date_str and m["meal_code"] == code:
-            return await _meal_response(
-                title, m["menu"], m["cal_info"], date_str, code
-            )
+            return _meal_response(title, m["menu"], m["cal_info"], date_str, code)
 
-    return await _meal_response(title, NO_MEAL, "")
+    return _meal_response(title, NO_MEAL, "")
+
+
+@router.get("/image")
+async def get_meal_image_url(
+    date: str = Query(..., regex="^[0-9]{8}$"),
+    meal_code: str = Query(..., regex="^[123]$"),
+):
+    return {"image_url": await get_meal_image(date, meal_code)}
