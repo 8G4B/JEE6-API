@@ -1,4 +1,6 @@
+import html
 import logging
+import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Query
@@ -69,6 +71,83 @@ async def _fetch_meals(from_ymd: str, to_ymd: str) -> list[dict]:
     return all_rows
 
 
+_SCHOOL_DAY_RE = re.compile(r'<div class="day_num">(\d+)<')
+_SCHOOL_MEAL_RE = re.compile(
+    r'food_title(\d)[^>]*>.*?<span class="content">(.*?)</span>', re.S
+)
+_BR_RE = re.compile(r"<br\s*/?>")
+
+
+def _parse_school_content(content: str) -> tuple[str, str]:
+    parts = [
+        html.unescape(re.sub(r"<[^>]+>", "", p)).strip()
+        for p in _BR_RE.split(content)
+    ]
+    parts = [p for p in parts if p]
+    dishes: list[str] = []
+    cal = ""
+    for i, p in enumerate(parts):
+        if p.startswith("*") and "에너지" in p:
+            if i + 1 < len(parts):
+                energy = parts[i + 1].split("/")[0].strip()
+                cal = f"{energy} Kcal" if energy else ""
+            break
+        dishes.append(p)
+    return "<br/>".join(dishes), cal
+
+
+async def _fetch_month_from_school(year: int, month: int) -> list[dict]:
+    url = f"{settings.MEAL_IMAGE_BASE_URL}/xboard/board.php"
+    params = {
+        "mode": "list",
+        "tbnum": settings.MEAL_IMAGE_TBNUM,
+        "sYear": year,
+        "sMonth": f"{month:02d}",
+    }
+    try:
+        async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
+            async with session.get(
+                url, params=params, timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                page = await resp.text()
+    except Exception as e:
+        logger.error(f"학교 급식 게시판 오류: {e}")
+        return []
+
+    marks = [(m.start(), int(m.group(1))) for m in _SCHOOL_DAY_RE.finditer(page)]
+    marks.append((len(page), None))
+
+    rows: list[dict] = []
+    for i in range(len(marks) - 1):
+        start, day = marks[i]
+        block = page[start : marks[i + 1][0]]
+        date_str = f"{year}{month:02d}{day:02d}"
+        for tm in _SCHOOL_MEAL_RE.finditer(block):
+            menu, cal = _parse_school_content(tm.group(2))
+            if menu:
+                rows.append(
+                    {
+                        "MLSV_YMD": date_str,
+                        "MMEAL_SC_CODE": tm.group(1),
+                        "DDISH_NM": menu,
+                        "CAL_INFO": cal,
+                    }
+                )
+    return rows
+
+
+async def _fetch_meals_from_school(from_ymd: str, to_ymd: str) -> list[dict]:
+    from_dt = datetime.strptime(from_ymd, "%Y%m%d")
+    to_dt = datetime.strptime(to_ymd, "%Y%m%d")
+    months = {(from_dt.year, from_dt.month), (to_dt.year, to_dt.month)}
+
+    rows: list[dict] = []
+    for year, month in months:
+        rows.extend(await _fetch_month_from_school(year, month))
+
+    return [r for r in rows if from_ymd <= r["MLSV_YMD"] <= to_ymd]
+
+
 def _format_menu(raw: str) -> str:
     return "\n".join(
         f"- {dish.strip()}"
@@ -135,6 +214,8 @@ async def get_meal(
         from_ymd = monday.strftime("%Y%m%d")
         to_ymd = (monday + timedelta(days=6)).strftime("%Y%m%d")
         rows = await _fetch_meals(from_ymd, to_ymd)
+        if not rows:
+            rows = await _fetch_meals_from_school(from_ymd, to_ymd)
         cached = [_format_meal(r) for r in rows]
         if cached:
             await cache.set(week_key, cached, ttl=CACHE_TTL)
@@ -144,7 +225,6 @@ async def get_meal(
             code, title = "1", "🍳 내일 아침"
         else:
             code, title = _detect_meal_type(now)
-            # 오늘(날짜 미지정) + 저녁 이후 → 내일 아침으로 롤오버 (기존 동작 유지)
             if date is None and code == "1" and title == "🍳 내일 아침":
                 tomorrow = now + timedelta(days=1)
                 tomorrow_str = tomorrow.strftime("%Y%m%d")
@@ -154,7 +234,6 @@ async def get_meal(
                             title, m["menu"], m["cal_info"], tomorrow_str, "1"
                         )
                 return _meal_response(title, NO_MEAL, "")
-            # 날짜를 지정했는데 '내일 아침'으로 잡히면 그냥 '아침'으로 표기
             if date is not None and title == "🍳 내일 아침":
                 code, title = "1", "🍳 아침"
     else:
