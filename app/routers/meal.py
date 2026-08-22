@@ -210,16 +210,20 @@ async def get_meal(
     monday = target - timedelta(days=target.weekday())
     week_key = f"meal:{monday.strftime('%Y%m%d')}"
 
-    cached = await cache.get(week_key)
-    if not cached:
+    async def load_week() -> list[dict]:
         from_ymd = monday.strftime("%Y%m%d")
         to_ymd = (monday + timedelta(days=6)).strftime("%Y%m%d")
         rows = await _fetch_meals(from_ymd, to_ymd)
         if not rows:
             rows = await _fetch_meals_from_school(from_ymd, to_ymd)
-        cached = [_format_meal(r) for r in rows]
-        if cached:
-            await cache.set(week_key, cached, ttl=CACHE_TTL)
+        return [_format_meal(r) for r in rows]
+
+    cached = await cache.get_or_set(
+        week_key,
+        load_week,
+        ttl=CACHE_TTL,
+        negative_ttl=300,
+    )
 
     if meal_type == "auto":
         if date is None and day == "tomorrow":

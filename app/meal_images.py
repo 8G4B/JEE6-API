@@ -64,10 +64,14 @@ async def get_meal_image(date_str: str, meal_code: str) -> str | None:
     year, month = int(date_str[:4]), int(date_str[4:6])
     cache_key = f"meal_img:{date_str[:6]}"
 
-    images = await cache.get(cache_key)
-    if images is None:
-        images = await _fetch_month_images(year, month)
-        if images:
-            await cache.set(cache_key, images, ttl=_ttl_for(year, month))
+    async def load_month() -> dict:
+        return await _fetch_month_images(year, month)
+
+    images = await cache.get_or_set(
+        cache_key,
+        load_month,
+        ttl=_ttl_for(year, month),
+        negative_ttl=300,
+    )
 
     return (images or {}).get(date_str, {}).get(meal_code)
