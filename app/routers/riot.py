@@ -1,7 +1,8 @@
 import asyncio
 import logging
-import requests
+
 from fastapi import APIRouter, Path
+
 from app.config import settings
 from app import cache
 from app.http_client import request
@@ -11,6 +12,8 @@ router = APIRouter()
 
 CACHE_TTL = 600
 CHAMPION_DATA: dict = {}
+CHAMPION_DATA_BY_KEY: dict[int, dict] = {}
+_CHAMPION_DATA_LOCK = asyncio.Lock()
 
 GAME_MODE_KR = {
     "CLASSIC": "소환사의 협곡",
@@ -35,33 +38,50 @@ def _riot_headers() -> dict:
     }
 
 
-def _load_champion_data_sync():
-    global CHAMPION_DATA
+async def _load_champion_data():
+    global CHAMPION_DATA, CHAMPION_DATA_BY_KEY
     if CHAMPION_DATA:
         return
-    try:
-        version_response = requests.get(
-            "https://ddragon.leagueoflegends.com/api/versions.json"
-        )
-        latest_version = version_response.json()[0]
-        champions_url = f"http://ddragon.leagueoflegends.com/cdn/{latest_version}/data/ko_KR/champion.json"
-        champions_response = requests.get(champions_url)
-        CHAMPION_DATA = champions_response.json()
-        logger.info(f"챔피언 데이터 로드 완료 (버전: {latest_version})")
-    except Exception as e:
-        logger.error(f"챔피언 데이터 로드 실패: {e}")
-        CHAMPION_DATA = {"data": {}}
+
+    async with _CHAMPION_DATA_LOCK:
+        if CHAMPION_DATA:
+            return
+
+        try:
+            async with request(
+                "GET",
+                "https://ddragon.leagueoflegends.com/api/versions.json",
+                upstream="ddragon",
+            ) as version_response:
+                if version_response.status != 200:
+                    raise RuntimeError(
+                        f"버전 조회 실패 (상태 코드: {version_response.status})"
+                    )
+                latest_version = (await version_response.json())[0]
+
+            champions_url = f"https://ddragon.leagueoflegends.com/cdn/{latest_version}/data/ko_KR/champion.json"
+            async with request(
+                "GET", champions_url, upstream="ddragon"
+            ) as champions_response:
+                if champions_response.status != 200:
+                    raise RuntimeError(
+                        f"챔피언 조회 실패 (상태 코드: {champions_response.status})"
+                    )
+                champion_data = await champions_response.json()
+
+            CHAMPION_DATA = champion_data
+            CHAMPION_DATA_BY_KEY = {
+                int(champion["key"]): champion
+                for champion in champion_data.get("data", {}).values()
+            }
+            logger.info("챔피언 데이터 로드 완료 (버전: %s)", latest_version)
+        except Exception:
+            logger.exception("챔피언 데이터 로드 실패")
 
 
 def _get_champion_name_kr(champion_id: str) -> str:
-    return next(
-        (
-            champ_info["name"]
-            for champ_name, champ_info in CHAMPION_DATA.get("data", {}).items()
-            if champ_name == champion_id
-        ),
-        champion_id,
-    )
+    champion = CHAMPION_DATA.get("data", {}).get(champion_id)
+    return champion["name"] if champion else champion_id
 
 
 async def _get_account(riot_id: str) -> dict:
@@ -89,7 +109,7 @@ async def lol_tier(riot_id: str = Path(...)):
     if cached:
         return cached
 
-    _load_champion_data_sync()
+    await _load_champion_data()
 
     account = await _get_account(riot_id)
     puuid = account["puuid"]
@@ -120,7 +140,7 @@ async def lol_history(riot_id: str = Path(...)):
     if cached:
         return cached
 
-    _load_champion_data_sync()
+    await _load_champion_data()
 
     account = await _get_account(riot_id)
     puuid = account["puuid"]
@@ -187,7 +207,7 @@ async def lol_rotation():
     if cached:
         return cached
 
-    _load_champion_data_sync()
+    await _load_champion_data()
 
     url = f"{settings.LOL_BASE_URL}/lol/platform/v3/champion-rotations"
     async with request("GET", url, upstream="riot", headers=_riot_headers()) as resp:
@@ -197,12 +217,11 @@ async def lol_rotation():
 
     champion_info = []
     for champ_id in data.get("freeChampionIds", []):
-        for champ_name, champ_data in CHAMPION_DATA.get("data", {}).items():
-            if int(champ_data["key"]) == champ_id:
-                champion_info.append(
-                    {"kr_name": champ_data["name"], "en_name": champ_name}
-                )
-                break
+        champ_data = CHAMPION_DATA_BY_KEY.get(champ_id)
+        if champ_data:
+            champion_info.append(
+                {"kr_name": champ_data["name"], "en_name": champ_data["id"]}
+            )
 
     result = {"champions": champion_info}
     await cache.set("lol:rotation", result, ttl=3600)
