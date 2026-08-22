@@ -85,61 +85,68 @@ def _get_champion_name_kr(champion_id: str) -> str:
 
 
 async def _get_account(riot_id: str) -> dict:
-    cached = await cache.get(f"riot:account:{riot_id}")
-    if cached:
-        return cached
-
     if "#" not in riot_id:
         raise ValueError("닉넴#태그 형식으로 입력하세요")
 
-    game_name, tag_line = riot_id.split("#")
-    url = f"{settings.LOL_ASIA_URL}/riot/account/v1/accounts/by-riot-id/{game_name}/{tag_line}"
-    async with request("GET", url, upstream="riot", headers=_riot_headers()) as resp:
-        if resp.status != 200:
-            raise ValueError(f"계정을 찾을 수 없습니다. (상태 코드: {resp.status})")
-        data = await resp.json()
+    async def load_account() -> dict:
+        game_name, tag_line = riot_id.split("#", maxsplit=1)
+        url = f"{settings.LOL_ASIA_URL}/riot/account/v1/accounts/by-riot-id/{game_name}/{tag_line}"
+        async with request(
+            "GET", url, upstream="riot", headers=_riot_headers()
+        ) as resp:
+            if resp.status != 200:
+                raise ValueError(f"계정을 찾을 수 없습니다. (상태 코드: {resp.status})")
+            return await resp.json()
 
-    await cache.set(f"riot:account:{riot_id}", data, ttl=CACHE_TTL)
-    return data
+    return await cache.get_or_set(
+        f"riot:account:{riot_id.casefold()}",
+        load_account,
+        ttl=CACHE_TTL,
+        negative_ttl=60,
+    )
 
 
 @router.get("/lol/tier/{riot_id}")
 async def lol_tier(riot_id: str = Path(...)):
-    cached = await cache.get(f"lol:tier:{riot_id}")
-    if cached:
-        return cached
+    async def load_tier() -> dict:
+        account = await _get_account(riot_id)
+        puuid = account["puuid"]
 
-    await _load_champion_data()
+        url = f"{settings.LOL_BASE_URL}/lol/summoner/v4/summoners/by-puuid/{puuid}"
+        async with request(
+            "GET", url, upstream="riot", headers=_riot_headers()
+        ) as resp:
+            if resp.status != 200:
+                return {"riot_id": riot_id, "solo_rank": None, "tier": "UNRANKED"}
+            summoner = await resp.json()
 
-    account = await _get_account(riot_id)
-    puuid = account["puuid"]
+        url = f"{settings.LOL_BASE_URL}/lol/league/v4/entries/by-summoner/{summoner['id']}"
+        async with request(
+            "GET", url, upstream="riot", headers=_riot_headers()
+        ) as resp:
+            if resp.status != 200:
+                return {"riot_id": riot_id, "solo_rank": None, "tier": "UNRANKED"}
+            entries = await resp.json()
 
-    url = f"{settings.LOL_BASE_URL}/lol/summoner/v4/summoners/by-puuid/{puuid}"
-    async with request("GET", url, upstream="riot", headers=_riot_headers()) as resp:
-        if resp.status != 200:
-            return {"riot_id": riot_id, "solo_rank": None, "tier": "UNRANKED"}
-        summoner = await resp.json()
+        solo = next(
+            (e for e in entries if e.get("queueType") == "RANKED_SOLO_5x5"), None
+        )
+        return {
+            "riot_id": riot_id,
+            "solo_rank": solo,
+            "tier": solo["tier"] if solo else "UNRANKED",
+        }
 
-    url = f"{settings.LOL_BASE_URL}/lol/league/v4/entries/by-summoner/{summoner['id']}"
-    async with request("GET", url, upstream="riot", headers=_riot_headers()) as resp:
-        if resp.status != 200:
-            return {"riot_id": riot_id, "solo_rank": None, "tier": "UNRANKED"}
-        entries = await resp.json()
-
-    solo = next((e for e in entries if e.get("queueType") == "RANKED_SOLO_5x5"), None)
-    tier = solo["tier"] if solo else "UNRANKED"
-
-    result = {"riot_id": riot_id, "solo_rank": solo, "tier": tier}
-    await cache.set(f"lol:tier:{riot_id}", result, ttl=CACHE_TTL)
-    return result
+    return await cache.get_or_set(
+        f"lol:tier:{riot_id.casefold()}",
+        load_tier,
+        ttl=CACHE_TTL,
+        negative_ttl=60,
+        is_negative=lambda value: value["tier"] == "UNRANKED",
+    )
 
 
-@router.get("/lol/history/{riot_id}")
-async def lol_history(riot_id: str = Path(...)):
-    cached = await cache.get(f"lol:history:{riot_id}")
-    if cached:
-        return cached
-
+async def _load_lol_history(riot_id: str) -> dict:
     await _load_champion_data()
 
     account = await _get_account(riot_id)
@@ -196,17 +203,21 @@ async def lol_history(riot_id: str = Path(...)):
             }
         )
 
-    result = {"riot_id": riot_id, "matches": matches}
-    await cache.set(f"lol:history:{riot_id}", result, ttl=CACHE_TTL)
-    return result
+    return {"riot_id": riot_id, "matches": matches}
 
 
-@router.get("/lol/rotation")
-async def lol_rotation():
-    cached = await cache.get("lol:rotation")
-    if cached:
-        return cached
+@router.get("/lol/history/{riot_id}")
+async def lol_history(riot_id: str = Path(...)):
+    return await cache.get_or_set(
+        f"lol:history:{riot_id.casefold()}",
+        lambda: _load_lol_history(riot_id),
+        ttl=CACHE_TTL,
+        negative_ttl=60,
+        is_negative=lambda value: not value["matches"],
+    )
 
+
+async def _load_lol_rotation() -> dict:
     await _load_champion_data()
 
     url = f"{settings.LOL_BASE_URL}/lol/platform/v3/champion-rotations"
@@ -223,17 +234,21 @@ async def lol_rotation():
                 {"kr_name": champ_data["name"], "en_name": champ_data["id"]}
             )
 
-    result = {"champions": champion_info}
-    await cache.set("lol:rotation", result, ttl=3600)
-    return result
+    return {"champions": champion_info}
 
 
-@router.get("/valo/tier/{riot_id}")
-async def valo_tier(riot_id: str = Path(...)):
-    cached = await cache.get(f"valo:tier:{riot_id}")
-    if cached:
-        return cached
+@router.get("/lol/rotation")
+async def lol_rotation():
+    return await cache.get_or_set(
+        "lol:rotation",
+        _load_lol_rotation,
+        ttl=3600,
+        negative_ttl=60,
+        is_negative=lambda value: not value["champions"],
+    )
 
+
+async def _load_valo_tier(riot_id: str) -> dict:
     account = await _get_account(riot_id)
     puuid = account["puuid"]
 
@@ -254,22 +269,26 @@ async def valo_tier(riot_id: str = Path(...)):
     else:
         tier = rank_data.get("currenttierpatched", "UNRANKED")
 
-    result = {
+    return {
         "riot_id": riot_id,
         "account": account,
         "rank_data": rank_data,
         "tier": tier,
     }
-    await cache.set(f"valo:tier:{riot_id}", result, ttl=CACHE_TTL)
-    return result
 
 
-@router.get("/valo/history/{riot_id}")
-async def valo_history(riot_id: str = Path(...)):
-    cached = await cache.get(f"valo:history:{riot_id}")
-    if cached:
-        return cached
+@router.get("/valo/tier/{riot_id}")
+async def valo_tier(riot_id: str = Path(...)):
+    return await cache.get_or_set(
+        f"valo:tier:{riot_id.casefold()}",
+        lambda: _load_valo_tier(riot_id),
+        ttl=CACHE_TTL,
+        negative_ttl=60,
+        is_negative=lambda value: value["tier"] == "UNRANKED",
+    )
 
+
+async def _load_valo_history(riot_id: str) -> dict:
     account = await _get_account(riot_id)
     puuid = account["puuid"]
 
@@ -321,6 +340,15 @@ async def valo_history(riot_id: str = Path(...)):
             }
         )
 
-    result = {"riot_id": riot_id, "account": account, "matches": formatted_matches}
-    await cache.set(f"valo:history:{riot_id}", result, ttl=CACHE_TTL)
-    return result
+    return {"riot_id": riot_id, "account": account, "matches": formatted_matches}
+
+
+@router.get("/valo/history/{riot_id}")
+async def valo_history(riot_id: str = Path(...)):
+    return await cache.get_or_set(
+        f"valo:history:{riot_id.casefold()}",
+        lambda: _load_valo_history(riot_id),
+        ttl=CACHE_TTL,
+        negative_ttl=60,
+        is_negative=lambda value: not value["matches"],
+    )
