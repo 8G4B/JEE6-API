@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, TypeVar
@@ -13,6 +14,9 @@ logger = logging.getLogger(__name__)
 
 pool: redis.Redis | None = None
 T = TypeVar("T")
+MEMORY_CACHE_TTL = 60
+
+_memory_cache: dict[str, tuple[float, Any]] = {}
 
 
 @dataclass
@@ -35,18 +39,34 @@ async def close_redis():
     global pool
     if pool:
         await pool.close()
+    pool = None
+    _memory_cache.clear()
 
 
 async def get(key: str) -> Any | None:
+    cached = _memory_cache.get(key)
+    if cached is not None:
+        expires_at, value = cached
+        if time.monotonic() < expires_at:
+            return value
+        _memory_cache.pop(key, None)
+
     if not pool:
         return None
     raw = await pool.get(key)
     if raw is None:
         return None
-    return json.loads(raw)
+    value = json.loads(raw)
+    _memory_cache[key] = (time.monotonic() + MEMORY_CACHE_TTL, value)
+    return value
 
 
 async def set(key: str, value: Any, ttl: int = 600):
+    if ttl > 0:
+        _memory_cache[key] = (time.monotonic() + ttl, value)
+    else:
+        _memory_cache.pop(key, None)
+
     if not pool:
         return
     await pool.set(key, json.dumps(value, ensure_ascii=False, default=str), ex=ttl)
