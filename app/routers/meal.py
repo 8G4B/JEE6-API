@@ -4,9 +4,9 @@ import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Query
-import aiohttp
 from app.config import settings
 from app import cache
+from app.http_client import request
 from app.meal_images import get_meal_image
 
 logger = logging.getLogger(__name__)
@@ -40,31 +40,30 @@ async def _fetch_meals(from_ymd: str, to_ymd: str) -> list[dict]:
     page = 1
 
     try:
-        async with aiohttp.ClientSession() as session:
-            while True:
-                params = {
-                    "key": settings.MEAL_API_KEY,
-                    "type": "json",
-                    "pIndex": page,
-                    "pSize": 100,
-                    "ATPT_OFCDC_SC_CODE": settings.ATPT_OFCDC_SC_CODE,
-                    "SD_SCHUL_CODE": settings.SD_SCHUL_CODE,
-                    "MLSV_FROM_YMD": from_ymd,
-                    "MLSV_TO_YMD": to_ymd,
-                }
-                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    data = await resp.json(content_type=None)
-                    info = data.get("mealServiceDietInfo", [{}])
-                    if len(info) < 2:
-                        break
+        while True:
+            params = {
+                "key": settings.MEAL_API_KEY,
+                "type": "json",
+                "pIndex": page,
+                "pSize": 100,
+                "ATPT_OFCDC_SC_CODE": settings.ATPT_OFCDC_SC_CODE,
+                "SD_SCHUL_CODE": settings.SD_SCHUL_CODE,
+                "MLSV_FROM_YMD": from_ymd,
+                "MLSV_TO_YMD": to_ymd,
+            }
+            async with request("GET", url, upstream="neis", params=params) as resp:
+                data = await resp.json(content_type=None)
+                info = data.get("mealServiceDietInfo", [{}])
+                if len(info) < 2:
+                    break
 
-                    rows = info[1].get("row", [])
-                    all_rows.extend(rows)
+                rows = info[1].get("row", [])
+                all_rows.extend(rows)
 
-                    total_count = info[0].get("head", [{}])[0].get("list_total_count", 0)
-                    if len(all_rows) >= total_count:
-                        break
-                    page += 1
+                total_count = info[0].get("head", [{}])[0].get("list_total_count", 0)
+                if len(all_rows) >= total_count:
+                    break
+                page += 1
     except Exception as e:
         logger.error(f"급식 API 오류: {e}")
 
@@ -80,8 +79,7 @@ _BR_RE = re.compile(r"<br\s*/?>")
 
 def _parse_school_content(content: str) -> tuple[str, str]:
     parts = [
-        html.unescape(re.sub(r"<[^>]+>", "", p)).strip()
-        for p in _BR_RE.split(content)
+        html.unescape(re.sub(r"<[^>]+>", "", p)).strip() for p in _BR_RE.split(content)
     ]
     parts = [p for p in parts if p]
     dishes: list[str] = []
@@ -105,11 +103,14 @@ async def _fetch_month_from_school(year: int, month: int) -> list[dict]:
         "sMonth": f"{month:02d}",
     }
     try:
-        async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
-            async with session.get(
-                url, params=params, timeout=aiohttp.ClientTimeout(total=10)
-            ) as resp:
-                page = await resp.text()
+        async with request(
+            "GET",
+            url,
+            upstream="school_meal",
+            params=params,
+            headers={"User-Agent": "Mozilla/5.0"},
+        ) as resp:
+            page = await resp.text()
     except Exception as e:
         logger.error(f"학교 급식 게시판 오류: {e}")
         return []
@@ -228,7 +229,7 @@ async def get_meal(
             if date is None and code == "1" and title == "🍳 내일 아침":
                 tomorrow = now + timedelta(days=1)
                 tomorrow_str = tomorrow.strftime("%Y%m%d")
-                for m in (cached or []):
+                for m in cached or []:
                     if m["date"] == tomorrow_str and m["meal_code"] == "1":
                         return _meal_response(
                             title, m["menu"], m["cal_info"], tomorrow_str, "1"
@@ -257,7 +258,7 @@ async def get_meal(
     if date is not None:
         title = f"{title} ({target.month}/{target.day})"
 
-    for m in (cached or []):
+    for m in cached or []:
         if m["date"] == date_str and m["meal_code"] == code:
             return _meal_response(title, m["menu"], m["cal_info"], date_str, code)
 

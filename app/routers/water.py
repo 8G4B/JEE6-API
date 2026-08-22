@@ -1,8 +1,8 @@
 import logging
 from fastapi import APIRouter
-import aiohttp
 from app.config import settings
 from app import cache
+from app.http_client import request
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -18,9 +18,8 @@ async def get_water_temp():
 
     url = f"{settings.WATER_API_BASE_URL}/{settings.SEOUL_DATA_API_KEY}/json/WPOSInformationTime/1/5/"
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                data = await resp.json(content_type=None)
+        async with request("GET", url, upstream="seoul_data") as resp:
+            data = await resp.json(content_type=None)
 
         if "WPOSInformationTime" not in data:
             return {"error": "데이터 없음"}

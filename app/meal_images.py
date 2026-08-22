@@ -2,9 +2,9 @@ import logging
 import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
-import aiohttp
 from app.config import settings
 from app import cache
+from app.http_client import request
 
 logger = logging.getLogger(__name__)
 
@@ -27,11 +27,10 @@ async def _fetch_month_images(year: int, month: int) -> dict:
     }
 
     try:
-        async with aiohttp.ClientSession(headers=_HEADERS) as session:
-            async with session.get(
-                url, params=params, timeout=aiohttp.ClientTimeout(total=10)
-            ) as resp:
-                html = await resp.text()
+        async with request(
+            "GET", url, upstream="school_meal", params=params, headers=_HEADERS
+        ) as resp:
+            html = await resp.text()
     except Exception as e:
         logger.error(f"급식 사진 게시판 오류: {e}")
         return {}
@@ -47,7 +46,9 @@ async def _fetch_month_images(year: int, month: int) -> dict:
         for img in _IMG_RE.finditer(html[start:end]):
             rel, code = img.group(1), img.group(2)
             path = rel.lstrip("./")
-            result.setdefault(date_str, {})[code] = f"{settings.MEAL_IMAGE_BASE_URL}/{path}"
+            result.setdefault(date_str, {})[code] = (
+                f"{settings.MEAL_IMAGE_BASE_URL}/{path}"
+            )
 
     return result
 

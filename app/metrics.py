@@ -15,6 +15,17 @@ REQUEST_DURATION = Histogram(
     ("method", "route"),
     buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10),
 )
+UPSTREAM_COUNT = Counter(
+    "jee6_api_upstream_requests_total",
+    "Total number of upstream HTTP requests made by the API gateway.",
+    ("upstream", "method", "status"),
+)
+UPSTREAM_DURATION = Histogram(
+    "jee6_api_upstream_request_duration_seconds",
+    "Upstream HTTP request duration in seconds.",
+    ("upstream", "method"),
+    buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10),
+)
 
 metrics_app = make_asgi_app()
 

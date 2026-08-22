@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from app import cache
+from app import http_client
 from app.metrics import metrics_app, observe_request
 from app.routers import meal, water, riot, spotify, time
 
@@ -8,8 +9,12 @@ from app.routers import meal, water, riot, spotify, time
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await cache.init_redis()
-    yield
-    await cache.close_redis()
+    await http_client.init_http_client()
+    try:
+        yield
+    finally:
+        await http_client.close_http_client()
+        await cache.close_redis()
 
 
 app = FastAPI(title="JEE6 API Gateway", lifespan=lifespan)
