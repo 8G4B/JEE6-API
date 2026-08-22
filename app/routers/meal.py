@@ -1,18 +1,20 @@
+import asyncio
 import html
 import logging
 import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Query
-import aiohttp
 from app.config import settings
 from app import cache
+from app.http_client import request
 from app.meal_images import get_meal_image
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-CACHE_TTL = 3600 * 6
+CACHE_TTL = 3600 * 24
+CACHE_REFRESH_INTERVAL = 3600
 
 NO_MEAL = "급식이 없습니다."
 
@@ -40,31 +42,30 @@ async def _fetch_meals(from_ymd: str, to_ymd: str) -> list[dict]:
     page = 1
 
     try:
-        async with aiohttp.ClientSession() as session:
-            while True:
-                params = {
-                    "key": settings.MEAL_API_KEY,
-                    "type": "json",
-                    "pIndex": page,
-                    "pSize": 100,
-                    "ATPT_OFCDC_SC_CODE": settings.ATPT_OFCDC_SC_CODE,
-                    "SD_SCHUL_CODE": settings.SD_SCHUL_CODE,
-                    "MLSV_FROM_YMD": from_ymd,
-                    "MLSV_TO_YMD": to_ymd,
-                }
-                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    data = await resp.json(content_type=None)
-                    info = data.get("mealServiceDietInfo", [{}])
-                    if len(info) < 2:
-                        break
+        while True:
+            params = {
+                "key": settings.MEAL_API_KEY,
+                "type": "json",
+                "pIndex": page,
+                "pSize": 100,
+                "ATPT_OFCDC_SC_CODE": settings.ATPT_OFCDC_SC_CODE,
+                "SD_SCHUL_CODE": settings.SD_SCHUL_CODE,
+                "MLSV_FROM_YMD": from_ymd,
+                "MLSV_TO_YMD": to_ymd,
+            }
+            async with request("GET", url, upstream="neis", params=params) as resp:
+                data = await resp.json(content_type=None)
+                info = data.get("mealServiceDietInfo", [{}])
+                if len(info) < 2:
+                    break
 
-                    rows = info[1].get("row", [])
-                    all_rows.extend(rows)
+                rows = info[1].get("row", [])
+                all_rows.extend(rows)
 
-                    total_count = info[0].get("head", [{}])[0].get("list_total_count", 0)
-                    if len(all_rows) >= total_count:
-                        break
-                    page += 1
+                total_count = info[0].get("head", [{}])[0].get("list_total_count", 0)
+                if len(all_rows) >= total_count:
+                    break
+                page += 1
     except Exception as e:
         logger.error(f"급식 API 오류: {e}")
 
@@ -80,8 +81,7 @@ _BR_RE = re.compile(r"<br\s*/?>")
 
 def _parse_school_content(content: str) -> tuple[str, str]:
     parts = [
-        html.unescape(re.sub(r"<[^>]+>", "", p)).strip()
-        for p in _BR_RE.split(content)
+        html.unescape(re.sub(r"<[^>]+>", "", p)).strip() for p in _BR_RE.split(content)
     ]
     parts = [p for p in parts if p]
     dishes: list[str] = []
@@ -105,11 +105,14 @@ async def _fetch_month_from_school(year: int, month: int) -> list[dict]:
         "sMonth": f"{month:02d}",
     }
     try:
-        async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
-            async with session.get(
-                url, params=params, timeout=aiohttp.ClientTimeout(total=10)
-            ) as resp:
-                page = await resp.text()
+        async with request(
+            "GET",
+            url,
+            upstream="school_meal",
+            params=params,
+            headers={"User-Agent": "Mozilla/5.0"},
+        ) as resp:
+            page = await resp.text()
     except Exception as e:
         logger.error(f"학교 급식 게시판 오류: {e}")
         return []
@@ -181,6 +184,72 @@ def _error_response(message: str) -> dict:
     return {"title": "❗ 오류", "menu": "", "cal_info": "", "error": message}
 
 
+def _week_start(target: datetime) -> datetime:
+    return target - timedelta(days=target.weekday())
+
+
+def _week_key(monday: datetime) -> str:
+    return f"meal:{monday.strftime('%Y%m%d')}"
+
+
+async def _load_week(monday: datetime) -> list[dict]:
+    from_ymd = monday.strftime("%Y%m%d")
+    to_ymd = (monday + timedelta(days=6)).strftime("%Y%m%d")
+    rows = await _fetch_meals(from_ymd, to_ymd)
+    if not rows:
+        rows = await _fetch_meals_from_school(from_ymd, to_ymd)
+    return [_format_meal(row) for row in rows]
+
+
+async def _get_week(monday: datetime) -> list[dict]:
+    return await cache.get_or_set(
+        _week_key(monday),
+        lambda: _load_week(monday),
+        ttl=CACHE_TTL,
+        negative_ttl=300,
+    )
+
+
+def _warmup_weeks(now: datetime) -> list[datetime]:
+    weeks = {
+        _week_start(now),
+        _week_start(now + timedelta(days=1)),
+    }
+    return sorted(weeks)
+
+
+async def warm_meal_cache(now: datetime | None = None) -> None:
+    current = now or datetime.now(ZoneInfo("Asia/Seoul"))
+    await asyncio.gather(*(_get_week(monday) for monday in _warmup_weeks(current)))
+
+
+async def refresh_meal_cache(now: datetime | None = None) -> None:
+    current = now or datetime.now(ZoneInfo("Asia/Seoul"))
+    weeks = _warmup_weeks(current)
+    results = await asyncio.gather(
+        *(_load_week(monday) for monday in weeks),
+        return_exceptions=True,
+    )
+    for monday, result in zip(weeks, results):
+        if isinstance(result, Exception):
+            logger.warning("급식 캐시 갱신 실패: %s", result)
+        elif result:
+            await cache.set(_week_key(monday), result, ttl=CACHE_TTL)
+        else:
+            logger.warning("빈 급식 응답을 받았습니다. 기존 캐시를 유지합니다.")
+
+
+async def maintain_meal_cache() -> None:
+    while True:
+        await asyncio.sleep(CACHE_REFRESH_INTERVAL)
+        try:
+            await refresh_meal_cache()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("급식 캐시 정기 갱신 실패")
+
+
 @router.get("/")
 async def get_meal(
     meal_type: str = Query("auto", regex="^(auto|breakfast|lunch|dinner)$"),
@@ -206,19 +275,8 @@ async def get_meal(
 
     date_str = target.strftime("%Y%m%d")
 
-    monday = target - timedelta(days=target.weekday())
-    week_key = f"meal:{monday.strftime('%Y%m%d')}"
-
-    cached = await cache.get(week_key)
-    if not cached:
-        from_ymd = monday.strftime("%Y%m%d")
-        to_ymd = (monday + timedelta(days=6)).strftime("%Y%m%d")
-        rows = await _fetch_meals(from_ymd, to_ymd)
-        if not rows:
-            rows = await _fetch_meals_from_school(from_ymd, to_ymd)
-        cached = [_format_meal(r) for r in rows]
-        if cached:
-            await cache.set(week_key, cached, ttl=CACHE_TTL)
+    monday = _week_start(target)
+    cached = await _get_week(monday)
 
     if meal_type == "auto":
         if date is None and day == "tomorrow":
@@ -228,7 +286,7 @@ async def get_meal(
             if date is None and code == "1" and title == "🍳 내일 아침":
                 tomorrow = now + timedelta(days=1)
                 tomorrow_str = tomorrow.strftime("%Y%m%d")
-                for m in (cached or []):
+                for m in cached or []:
                     if m["date"] == tomorrow_str and m["meal_code"] == "1":
                         return _meal_response(
                             title, m["menu"], m["cal_info"], tomorrow_str, "1"
@@ -257,7 +315,7 @@ async def get_meal(
     if date is not None:
         title = f"{title} ({target.month}/{target.day})"
 
-    for m in (cached or []):
+    for m in cached or []:
         if m["date"] == date_str and m["meal_code"] == code:
             return _meal_response(title, m["menu"], m["cal_info"], date_str, code)
 

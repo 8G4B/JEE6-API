@@ -2,9 +2,9 @@ import logging
 import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
-import aiohttp
 from app.config import settings
 from app import cache
+from app.http_client import request
 
 logger = logging.getLogger(__name__)
 
@@ -27,11 +27,10 @@ async def _fetch_month_images(year: int, month: int) -> dict:
     }
 
     try:
-        async with aiohttp.ClientSession(headers=_HEADERS) as session:
-            async with session.get(
-                url, params=params, timeout=aiohttp.ClientTimeout(total=10)
-            ) as resp:
-                html = await resp.text()
+        async with request(
+            "GET", url, upstream="school_meal", params=params, headers=_HEADERS
+        ) as resp:
+            html = await resp.text()
     except Exception as e:
         logger.error(f"급식 사진 게시판 오류: {e}")
         return {}
@@ -47,7 +46,9 @@ async def _fetch_month_images(year: int, month: int) -> dict:
         for img in _IMG_RE.finditer(html[start:end]):
             rel, code = img.group(1), img.group(2)
             path = rel.lstrip("./")
-            result.setdefault(date_str, {})[code] = f"{settings.MEAL_IMAGE_BASE_URL}/{path}"
+            result.setdefault(date_str, {})[code] = (
+                f"{settings.MEAL_IMAGE_BASE_URL}/{path}"
+            )
 
     return result
 
@@ -63,10 +64,14 @@ async def get_meal_image(date_str: str, meal_code: str) -> str | None:
     year, month = int(date_str[:4]), int(date_str[4:6])
     cache_key = f"meal_img:{date_str[:6]}"
 
-    images = await cache.get(cache_key)
-    if images is None:
-        images = await _fetch_month_images(year, month)
-        if images:
-            await cache.set(cache_key, images, ttl=_ttl_for(year, month))
+    async def load_month() -> dict:
+        return await _fetch_month_images(year, month)
+
+    images = await cache.get_or_set(
+        cache_key,
+        load_month,
+        ttl=_ttl_for(year, month),
+        negative_ttl=300,
+    )
 
     return (images or {}).get(date_str, {}).get(meal_code)

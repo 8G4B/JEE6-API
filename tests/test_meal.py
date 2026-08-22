@@ -1,15 +1,20 @@
 from datetime import datetime
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, call, patch
 from zoneinfo import ZoneInfo
+
+import pytest
+
+from app.routers import meal
 
 
 def test_get_meal_no_cache_no_api(client):
-    with patch(
-        "app.routers.meal._fetch_meals", new_callable=AsyncMock, return_value=[]
-    ), patch(
-        "app.routers.meal._fetch_meals_from_school",
-        new_callable=AsyncMock,
-        return_value=[],
+    with (
+        patch("app.routers.meal._fetch_meals", new_callable=AsyncMock, return_value=[]),
+        patch(
+            "app.routers.meal._fetch_meals_from_school",
+            new_callable=AsyncMock,
+            return_value=[],
+        ),
     ):
         response = client.get("/meal/?meal_type=auto&day=today")
         assert response.status_code == 200
@@ -28,12 +33,13 @@ def test_get_meal_falls_back_to_school(client):
             "CAL_INFO": "800.0 Kcal",
         }
     ]
-    with patch(
-        "app.routers.meal._fetch_meals", new_callable=AsyncMock, return_value=[]
-    ), patch(
-        "app.routers.meal._fetch_meals_from_school",
-        new_callable=AsyncMock,
-        return_value=school_rows,
+    with (
+        patch("app.routers.meal._fetch_meals", new_callable=AsyncMock, return_value=[]),
+        patch(
+            "app.routers.meal._fetch_meals_from_school",
+            new_callable=AsyncMock,
+            return_value=school_rows,
+        ),
     ):
         response = client.get(f"/meal/?meal_type=lunch&date={today}")
         assert response.status_code == 200
@@ -50,3 +56,30 @@ def test_get_meal_invalid_type(client):
 def test_get_meal_invalid_day(client):
     response = client.get("/meal/?day=yesterday")
     assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_warm_meal_cache_loads_current_and_next_week_on_sunday():
+    sunday = datetime(2026, 8, 23, 12, tzinfo=ZoneInfo("Asia/Seoul"))
+
+    with patch("app.routers.meal._get_week", new_callable=AsyncMock) as get_week:
+        await meal.warm_meal_cache(sunday)
+
+    assert get_week.await_count == 2
+    assert get_week.await_args_list == [
+        call(datetime(2026, 8, 17, 12, tzinfo=ZoneInfo("Asia/Seoul"))),
+        call(datetime(2026, 8, 24, 12, tzinfo=ZoneInfo("Asia/Seoul"))),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_refresh_meal_cache_keeps_stale_data_on_empty_response():
+    now = datetime(2026, 8, 22, 12, tzinfo=ZoneInfo("Asia/Seoul"))
+
+    with (
+        patch("app.routers.meal._load_week", new_callable=AsyncMock, return_value=[]),
+        patch("app.routers.meal.cache.set", new_callable=AsyncMock) as cache_set,
+    ):
+        await meal.refresh_meal_cache(now)
+
+    cache_set.assert_not_awaited()
