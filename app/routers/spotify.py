@@ -7,7 +7,6 @@ import spotipy
 from spotipy.oauth2 import SpotifyOAuth, SpotifyClientCredentials
 from spotipy.cache_handler import MemoryCacheHandler
 from app.config import settings
-from app import cache
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -16,6 +15,7 @@ _client: spotipy.Spotify | None = None
 _playlist_total_cache: dict[str, tuple[float, int]] = {}
 _artist_genres_cache: dict[str, tuple[float, list]] = {}
 CACHE_TTL = 3600
+MAX_TRACK_ATTEMPTS = 5
 
 
 def _get_client() -> spotipy.Spotify:
@@ -24,14 +24,16 @@ def _get_client() -> spotipy.Spotify:
         return _client
 
     if settings.SPOTIFY_REFRESH_TOKEN:
-        cache_handler = MemoryCacheHandler(token_info={
-            "access_token": None,
-            "token_type": "Bearer",
-            "expires_in": 3600,
-            "refresh_token": settings.SPOTIFY_REFRESH_TOKEN,
-            "scope": "playlist-read-private playlist-read-collaborative",
-            "expires_at": 0,
-        })
+        cache_handler = MemoryCacheHandler(
+            token_info={
+                "access_token": None,
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "refresh_token": settings.SPOTIFY_REFRESH_TOKEN,
+                "scope": "playlist-read-private playlist-read-collaborative",
+                "expires_at": 0,
+            }
+        )
         auth_manager = SpotifyOAuth(
             client_id=settings.SPOTIFY_CLIENT_ID,
             client_secret=settings.SPOTIFY_CLIENT_SECRET,
@@ -72,55 +74,68 @@ def _fetch_random_track(playlist_id: str) -> dict | None:
         if total == 0:
             return None
 
-        offset = random.randint(0, total - 1)
-        result = client.playlist_tracks(
-            playlist_id,
-            limit=1,
-            offset=offset,
-            fields="items(track(id,name,artists(id,name),album(name,images),external_urls,duration_ms))",
-        )
+        offsets = random.sample(range(total), min(total, MAX_TRACK_ATTEMPTS))
+        for offset in offsets:
+            result = client.playlist_tracks(
+                playlist_id,
+                limit=1,
+                offset=offset,
+                fields=(
+                    "items(track(id,name,is_local,artists(id,name),"
+                    "album(name,images),external_urls,duration_ms))"
+                ),
+            )
 
-        items = result.get("items", [])
-        if not items or not items[0].get("track"):
-            return None
+            items = result.get("items", [])
+            track = items[0].get("track") if items else None
+            if not track or track.get("is_local") or not track.get("id"):
+                continue
 
-        track = items[0]["track"]
-        artists = ", ".join(a["name"] for a in track["artists"])
-        album_img = (
-            track["album"]["images"][0]["url"]
-            if track["album"]["images"]
-            else None
-        )
-        duration_ms = track.get("duration_ms", 0)
-        minutes, seconds = divmod(duration_ms // 1000, 60)
+            spotify_url = track.get("external_urls", {}).get("spotify")
+            album = track.get("album") or {}
+            artist_items = track.get("artists") or []
+            artists = ", ".join(
+                artist["name"] for artist in artist_items if artist.get("name")
+            )
+            if not track.get("name") or not spotify_url or not artists:
+                continue
 
-        genres = []
-        if track["artists"]:
-            artist_id = track["artists"][0]["id"]
-            if artist_id in _artist_genres_cache:
-                cache_time, cached_genres = _artist_genres_cache[artist_id]
-                if time.time() - cache_time < CACHE_TTL:
-                    genres = cached_genres
+            images = album.get("images") or []
+            album_img = images[0].get("url") if images else None
+            duration_ms = track.get("duration_ms", 0)
+            minutes, seconds = divmod(duration_ms // 1000, 60)
+
+            genres = []
+            artist_id = artist_items[0].get("id") if artist_items else None
+            if artist_id:
+                cached = _artist_genres_cache.get(artist_id)
+                if cached and time.time() - cached[0] < CACHE_TTL:
+                    genres = cached[1]
                 else:
-                    artist_info = client.artist(artist_id)
-                    genres = artist_info.get("genres", [])
-                    _artist_genres_cache[artist_id] = (time.time(), genres)
-            else:
-                artist_info = client.artist(artist_id)
-                genres = artist_info.get("genres", [])
-                _artist_genres_cache[artist_id] = (time.time(), genres)
+                    try:
+                        artist_info = client.artist(artist_id)
+                        genres = artist_info.get("genres", [])
+                        _artist_genres_cache[artist_id] = (time.time(), genres)
+                    except Exception:
+                        logger.warning(
+                            "Spotify 아티스트 장르 조회 실패",
+                            exc_info=True,
+                        )
 
-        return {
-            "name": track["name"],
-            "artists": artists,
-            "album": track["album"]["name"],
-            "url": track["external_urls"]["spotify"],
-            "image": album_img,
-            "duration": f"{minutes}:{seconds:02d}",
-            "genres": genres,
-        }
-    except Exception as e:
-        logger.error(f"Spotify API 오류: {e}")
+            return {
+                "name": track["name"],
+                "artists": artists,
+                "album": album.get("name", ""),
+                "url": spotify_url,
+                "image": album_img,
+                "duration": f"{minutes}:{seconds:02d}",
+                "genres": genres,
+            }
+
+        logger.warning("Spotify 플레이리스트에서 유효한 곡을 찾지 못했습니다")
+        return None
+    except Exception:
+        logger.exception("Spotify API 곡 조회 실패")
         return None
 
 
@@ -132,8 +147,7 @@ async def random_track():
 
     playlist_id = random.choice(playlist_ids)
 
-    loop = asyncio.get_event_loop()
-    track = await loop.run_in_executor(None, _fetch_random_track, playlist_id)
+    track = await asyncio.to_thread(_fetch_random_track, playlist_id)
 
     if track:
         return track
