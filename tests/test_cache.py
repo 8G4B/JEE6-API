@@ -51,3 +51,31 @@ async def test_get_or_set_uses_short_ttl_for_empty_values(monkeypatch):
 
     assert await cache.get_or_set("empty-key", loader, ttl=600, negative_ttl=30) == []
     assert recorded_ttls == [30]
+
+
+@pytest.mark.asyncio
+async def test_get_or_set_supports_custom_negative_values(monkeypatch):
+    recorded_ttls = []
+
+    async def fake_get(key):
+        return None
+
+    async def fake_set(key, value, ttl):
+        recorded_ttls.append(ttl)
+
+    async def loader():
+        return {"error": "unavailable"}
+
+    monkeypatch.setattr(cache, "get", fake_get)
+    monkeypatch.setattr(cache, "set", fake_set)
+
+    result = await cache.get_or_set(
+        "error-key",
+        loader,
+        ttl=600,
+        negative_ttl=30,
+        is_negative=lambda value: "error" in value,
+    )
+
+    assert result == {"error": "unavailable"}
+    assert recorded_ttls == [30]

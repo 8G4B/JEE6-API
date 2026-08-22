@@ -83,6 +83,7 @@ async def get_or_set(
     *,
     ttl: int = 600,
     negative_ttl: int = 60,
+    is_negative: Callable[[T], bool] | None = None,
 ) -> T:
     cached = await get(key)
     if cached is not None:
@@ -94,7 +95,8 @@ async def get_or_set(
             return cached
 
         value = await loader()
-        value_ttl = ttl if value else negative_ttl
+        negative = is_negative(value) if is_negative else not value
+        value_ttl = negative_ttl if negative else ttl
         if value_ttl > 0:
             await set(key, value, ttl=value_ttl)
         return value
