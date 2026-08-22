@@ -284,17 +284,24 @@ async def valo_history(riot_id: str = Path(...)):
     if "history" not in matches_data or not matches_data["history"]:
         raise ValueError("최근 게임 기록이 없습니다.")
 
-    formatted_matches = []
-    for match in matches_data["history"][:5]:
+    async def fetch_match(match: dict) -> dict | None:
         match_id = match["matchId"]
         murl = f"{settings.VALO_AP_URL}/val/match/v1/matches/{match_id}"
         async with request(
             "GET", murl, upstream="riot", headers=_riot_headers()
         ) as response:
             if response.status != 200:
-                continue
-            match_data = await response.json()
+                return None
+            return await response.json()
 
+    match_details = await asyncio.gather(
+        *[fetch_match(match) for match in matches_data["history"][:5]]
+    )
+
+    formatted_matches = []
+    for match_data in match_details:
+        if not match_data:
+            continue
         player = next((p for p in match_data["players"] if p["puuid"] == puuid), None)
         if not player:
             continue
