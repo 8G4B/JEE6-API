@@ -2,7 +2,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager, suppress
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
 from app import cache
 from app import http_client
@@ -59,3 +59,14 @@ app.include_router(time.router, prefix="/time", tags=["time"])
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/ready")
+async def ready():
+    if cache.pool is None:
+        raise HTTPException(status_code=503, detail="Redis is not initialized")
+    try:
+        await cache.pool.ping()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Redis is unavailable") from exc
+    return {"status": "ready"}
