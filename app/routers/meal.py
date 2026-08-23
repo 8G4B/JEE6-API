@@ -286,6 +286,9 @@ async def get_meal(
             if date is None and code == "1" and title == "🍳 내일 아침":
                 tomorrow = now + timedelta(days=1)
                 tomorrow_str = tomorrow.strftime("%Y%m%d")
+                tomorrow_monday = _week_start(tomorrow)
+                if _week_key(tomorrow_monday) != _week_key(monday):
+                    cached = await _get_week(tomorrow_monday)
                 for m in cached or []:
                     if m["date"] == tomorrow_str and m["meal_code"] == "1":
                         return _meal_response(

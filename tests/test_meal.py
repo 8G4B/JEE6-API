@@ -83,3 +83,33 @@ async def test_refresh_meal_cache_keeps_stale_data_on_empty_response():
         await meal.refresh_meal_cache(now)
 
     cache_set.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_auto_meal_reads_next_week_cache_on_sunday_night():
+    class SundayNight(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 8, 23, 22, 19, tzinfo=tz)
+
+    next_monday_breakfast = {
+        "date": "20260824",
+        "meal_code": "1",
+        "menu": "- 친환경백미밥",
+        "cal_info": "577.91 Kcal",
+    }
+
+    with (
+        patch("app.routers.meal.datetime", SundayNight),
+        patch(
+            "app.routers.meal._get_week",
+            new_callable=AsyncMock,
+            side_effect=[[], [next_monday_breakfast]],
+        ) as get_week,
+    ):
+        result = await meal.get_meal(meal_type="auto", day="today", date=None)
+
+    assert result["title"] == "🍳 내일 아침"
+    assert result["menu"] == "- 친환경백미밥"
+    assert result["date"] == "20260824"
+    assert get_week.await_count == 2
