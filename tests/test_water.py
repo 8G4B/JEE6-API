@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 from unittest.mock import patch, MagicMock
 
@@ -27,3 +28,50 @@ def test_get_water_temp_success(client):
         assert data["hour"] == "14"
         assert data["minute"] == "30"
         assert data["temp"] == "22.5"
+
+
+def test_get_water_temp_falls_back_when_seoul_api_times_out(client):
+    fallback_data = {
+        "success": True,
+        "date": "20260824",
+        "time": "13:00",
+        "location": "중랑천",
+        "temperature": 28.3,
+    }
+    upstreams = []
+
+    @asynccontextmanager
+    async def mock_request(method, url, **kwargs):
+        upstreams.append(kwargs["upstream"])
+        if kwargs["upstream"] == "seoul_data":
+            raise asyncio.TimeoutError
+
+        resp = MagicMock()
+
+        async def json_fn(content_type=None):
+            return fallback_data
+
+        resp.json = json_fn
+        yield resp
+
+    with patch("app.routers.water.request", mock_request):
+        response = client.get("/water/")
+
+    assert response.status_code == 200
+    assert response.json() == {"hour": "13", "minute": "00", "temp": "28.3"}
+    assert upstreams == ["seoul_data", "hangang_temp_fallback"]
+
+
+def test_get_water_temp_returns_friendly_error_when_all_sources_fail(client):
+    @asynccontextmanager
+    async def mock_request(method, url, **kwargs):
+        raise asyncio.TimeoutError
+        yield
+
+    with patch("app.routers.water.request", mock_request):
+        response = client.get("/water/")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "error": "한강 수온 정보를 가져올 수 없습니다. 잠시 후 다시 시도해주세요."
+    }
