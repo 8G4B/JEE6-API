@@ -113,3 +113,49 @@ async def test_auto_meal_reads_next_week_cache_on_sunday_night():
     assert result["menu"] == "- 친환경백미밥"
     assert result["date"] == "20260824"
     assert get_week.await_count == 2
+
+
+def test_parse_school_content_merges_wrapped_dish_names():
+    # 학교 게시판은 메뉴명이 길면 중간에 <br />를 넣어 올린다.
+    content = (
+        "오므라이스<br />\n"
+        "(1.2.5.6.10.12.13.15.16.18)<br />\n"
+        "얼갈이된장국(5.6.9.13)<br />\n"
+        "진미채야채초무침(자율)<br />\n"
+        "(5.6.13.17)<br />\n"
+        "청포도주스<br />\n"
+        "*에너지/단백질/칼슘/철<br />\n"
+        "887.91/37.84/310.41/3.81"
+    )
+    menu, cal = meal._parse_school_content(content)
+
+    assert menu.split("<br/>") == [
+        "오므라이스(1.2.5.6.10.12.13.15.16.18)",
+        "얼갈이된장국(5.6.9.13)",
+        "진미채야채초무침(자율)(5.6.13.17)",
+        "청포도주스",
+    ]
+    assert cal == "887.91 Kcal"
+
+
+def test_parse_school_content_merges_break_inside_parens():
+    content = "상추쌈,청양고추&amp;쌈장(<br />\n5.6.13)<br />\n배추김치(9)"
+    menu, _ = meal._parse_school_content(content)
+
+    assert menu.split("<br/>") == ["상추쌈,청양고추&쌈장(5.6.13)", "배추김치(9)"]
+
+
+def test_parse_school_content_merges_star_continuation_but_keeps_banner():
+    content = (
+        "*잔반없는날*<br />\n"
+        "감말랭이양상추샐러드<br />\n"
+        "*오리엔탈s(5.6.12.13)<br />\n"
+        "배추김치(9)"
+    )
+    menu, _ = meal._parse_school_content(content)
+
+    assert menu.split("<br/>") == [
+        "*잔반없는날*",
+        "감말랭이양상추샐러드*오리엔탈s(5.6.12.13)",
+        "배추김치(9)",
+    ]

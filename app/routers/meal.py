@@ -79,6 +79,20 @@ _SCHOOL_MEAL_RE = re.compile(
 _BR_RE = re.compile(r"<br\s*/?>")
 
 
+def _is_continuation(prev: str, part: str) -> bool:
+    """학교 게시판은 메뉴명이 길면 중간에 <br/>를 넣어 올린다.
+    새 메뉴가 아니라 앞 메뉴에서 이어지는 줄인지 판별한다."""
+    # "상추쌈,청양고추&쌈장(" + "5.6.13)" — 괄호 안에서 끊긴 경우
+    if prev.count("(") > prev.count(")"):
+        return True
+    # "오므라이스" + "(1.2.5.6.10.12.13.15.16.18)" — 알레르기 번호만 넘어간 경우
+    if part.startswith("("):
+        return True
+    # "감말랭이양상추샐러드" + "*오리엔탈s(5.6.12.13)" — 부재료가 넘어간 경우.
+    # 단 "*잔반없는날*" 처럼 앞뒤가 *로 감싸인 문구는 별도 줄로 둔다.
+    return part.startswith("*") and not part.endswith("*")
+
+
 def _parse_school_content(content: str) -> tuple[str, str]:
     parts = [
         html.unescape(re.sub(r"<[^>]+>", "", p)).strip() for p in _BR_RE.split(content)
@@ -92,7 +106,10 @@ def _parse_school_content(content: str) -> tuple[str, str]:
                 energy = parts[i + 1].split("/")[0].strip()
                 cal = f"{energy} Kcal" if energy else ""
             break
-        dishes.append(p)
+        if dishes and _is_continuation(dishes[-1], p):
+            dishes[-1] += p
+        else:
+            dishes.append(p)
     return "<br/>".join(dishes), cal
 
 

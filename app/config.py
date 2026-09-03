@@ -13,7 +13,12 @@ class Settings:
     MEAL_IMAGE_TBNUM = os.getenv("MEAL_IMAGE_TBNUM", "42")
 
     SEOUL_DATA_API_KEY = os.getenv("SEOUL_DATA_API_KEY", "sample")
-    WATER_API_BASE_URL = "http://openapi.seoul.go.kr:8088"
+    WATER_API_BASE_URL = os.getenv(
+        "WATER_API_BASE_URL", "http://openapi.seoul.go.kr:8088"
+    )
+    WATER_FALLBACK_API_URL = os.getenv(
+        "WATER_FALLBACK_API_URL", "https://api.ivl.is/hangangtemp/"
+    )
 
     RIOT_API_KEY = os.getenv("RIOT_API_KEY", "")
     LOL_BASE_URL = "https://kr.api.riotgames.com"
