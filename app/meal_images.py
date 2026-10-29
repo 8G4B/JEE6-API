@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 # 지난 달 사진은 더 이상 바뀌지 않으므로 아주 길게 캐싱한다.
 # 이번 달(미래 포함)은 사진이 계속 올라오므로 짧게 잡아 새 사진을 반영한다.
 CACHE_TTL_PAST = 3600 * 24 * 30
-CACHE_TTL_CURRENT = 3600
+CACHE_TTL_CURRENT = 300
 _HEADERS = {"User-Agent": "Mozilla/5.0"}
 _DAY_RE = re.compile(r'<div class="day_num">(\d+)<')
 _IMG_RE = re.compile(r"imgOpen\('([^']*?_(\d)_middle_thumb\.[a-zA-Z]+)'")

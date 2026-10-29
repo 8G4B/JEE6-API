@@ -54,20 +54,24 @@ async def _fetch_meals(from_ymd: str, to_ymd: str) -> list[dict]:
                 "MLSV_TO_YMD": to_ymd,
             }
             async with request("GET", url, upstream="neis", params=params) as resp:
+                resp.raise_for_status()
                 data = await resp.json(content_type=None)
                 info = data.get("mealServiceDietInfo", [{}])
                 if len(info) < 2:
-                    break
+                    if data.get("RESULT", {}).get("CODE") == "INFO-200":
+                        break
+                    raise RuntimeError("NEIS 급식 응답을 확인할 수 없습니다.")
 
                 rows = info[1].get("row", [])
                 all_rows.extend(rows)
 
                 total_count = info[0].get("head", [{}])[0].get("list_total_count", 0)
-                if len(all_rows) >= total_count:
+                if not rows or len(all_rows) >= total_count:
                     break
                 page += 1
     except Exception as e:
         logger.error(f"급식 API 오류: {e}")
+        raise
 
     return all_rows
 
@@ -129,12 +133,15 @@ async def _fetch_month_from_school(year: int, month: int) -> list[dict]:
             params=params,
             headers={"User-Agent": "Mozilla/5.0"},
         ) as resp:
+            resp.raise_for_status()
             page = await resp.text()
     except Exception as e:
         logger.error(f"학교 급식 게시판 오류: {e}")
-        return []
+        raise
 
     marks = [(m.start(), int(m.group(1))) for m in _SCHOOL_DAY_RE.finditer(page)]
+    if not marks:
+        raise RuntimeError("학교 급식 달력을 확인할 수 없습니다.")
     marks.append((len(page), None))
 
     rows: list[dict] = []
@@ -161,9 +168,10 @@ async def _fetch_meals_from_school(from_ymd: str, to_ymd: str) -> list[dict]:
     to_dt = datetime.strptime(to_ymd, "%Y%m%d")
     months = {(from_dt.year, from_dt.month), (to_dt.year, to_dt.month)}
 
-    rows: list[dict] = []
-    for year, month in months:
-        rows.extend(await _fetch_month_from_school(year, month))
+    results = await asyncio.gather(
+        *(_fetch_month_from_school(year, month) for year, month in sorted(months))
+    )
+    rows = [row for result in results for row in result]
 
     return [r for r in rows if from_ymd <= r["MLSV_YMD"] <= to_ymd]
 
@@ -202,7 +210,9 @@ def _error_response(message: str) -> dict:
 
 
 def _week_start(target: datetime) -> datetime:
-    return target - timedelta(days=target.weekday())
+    return (target - timedelta(days=target.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
 
 
 def _week_key(monday: datetime) -> str:
@@ -212,7 +222,11 @@ def _week_key(monday: datetime) -> str:
 async def _load_week(monday: datetime) -> list[dict]:
     from_ymd = monday.strftime("%Y%m%d")
     to_ymd = (monday + timedelta(days=6)).strftime("%Y%m%d")
-    rows = await _fetch_meals(from_ymd, to_ymd)
+    try:
+        rows = await _fetch_meals(from_ymd, to_ymd)
+    except Exception:
+        logger.warning("NEIS 조회 실패, 학교 급식 게시판으로 재시도합니다.")
+        rows = []
     if not rows:
         rows = await _fetch_meals_from_school(from_ymd, to_ymd)
     return [_format_meal(row) for row in rows]
@@ -228,11 +242,8 @@ async def _get_week(monday: datetime) -> list[dict]:
 
 
 def _warmup_weeks(now: datetime) -> list[datetime]:
-    weeks = {
-        _week_start(now),
-        _week_start(now + timedelta(days=1)),
-    }
-    return sorted(weeks)
+    monday = _week_start(now)
+    return [monday, monday + timedelta(days=7)]
 
 
 async def warm_meal_cache(now: datetime | None = None) -> None:
@@ -267,6 +278,27 @@ async def maintain_meal_cache() -> None:
             logger.exception("급식 캐시 정기 갱신 실패")
 
 
+@router.get("/week")
+async def get_meal_week(date: str = Query(..., regex="^[0-9]{8}$")):
+    # 봇이 식사 전환 시각에도 외부 조회 없이 메뉴를 선택할 수 있도록 제공한다.
+    # 연말에는 다음 해 식단도 예열해야 하므로 여기에는 올해 제한을 두지 않는다.
+    try:
+        target = datetime.strptime(date, "%Y%m%d").replace(
+            tzinfo=ZoneInfo("Asia/Seoul")
+        )
+    except ValueError:
+        return _error_response("올바르지 않은 날짜예요.")
+    monday = _week_start(target)
+    try:
+        meals = await _get_week(monday)
+    except Exception:
+        logger.exception("주간 급식 조회 실패")
+        return _error_response(
+            "급식 정보를 불러오지 못했어요. 잠시 후 다시 시도해주세요."
+        )
+    return {"week_start": monday.strftime("%Y%m%d"), "meals": meals}
+
+
 @router.get("/")
 async def get_meal(
     meal_type: str = Query("auto", regex="^(auto|breakfast|lunch|dinner)$"),
@@ -293,7 +325,13 @@ async def get_meal(
     date_str = target.strftime("%Y%m%d")
 
     monday = _week_start(target)
-    cached = await _get_week(monday)
+    try:
+        cached = await _get_week(monday)
+    except Exception:
+        logger.exception("급식 조회 실패")
+        return _error_response(
+            "급식 정보를 불러오지 못했어요. 잠시 후 다시 시도해주세요."
+        )
 
     if meal_type == "auto":
         if date is None and day == "tomorrow":
@@ -305,7 +343,13 @@ async def get_meal(
                 tomorrow_str = tomorrow.strftime("%Y%m%d")
                 tomorrow_monday = _week_start(tomorrow)
                 if _week_key(tomorrow_monday) != _week_key(monday):
-                    cached = await _get_week(tomorrow_monday)
+                    try:
+                        cached = await _get_week(tomorrow_monday)
+                    except Exception:
+                        logger.exception("다음 주 급식 조회 실패")
+                        return _error_response(
+                            "급식 정보를 불러오지 못했어요. 잠시 후 다시 시도해주세요."
+                        )
                 for m in cached or []:
                     if m["date"] == tomorrow_str and m["meal_code"] == "1":
                         return _meal_response(

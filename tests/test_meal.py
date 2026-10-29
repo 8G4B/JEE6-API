@@ -1,5 +1,6 @@
+from contextlib import asynccontextmanager
 from datetime import datetime
-from unittest.mock import AsyncMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -67,8 +68,8 @@ async def test_warm_meal_cache_loads_current_and_next_week_on_sunday():
 
     assert get_week.await_count == 2
     assert get_week.await_args_list == [
-        call(datetime(2026, 8, 17, 12, tzinfo=ZoneInfo("Asia/Seoul"))),
-        call(datetime(2026, 8, 24, 12, tzinfo=ZoneInfo("Asia/Seoul"))),
+        call(datetime(2026, 8, 17, tzinfo=ZoneInfo("Asia/Seoul"))),
+        call(datetime(2026, 8, 24, tzinfo=ZoneInfo("Asia/Seoul"))),
     ]
 
 
@@ -159,3 +160,141 @@ def test_parse_school_content_merges_star_continuation_but_keeps_banner():
         "감말랭이양상추샐러드*오리엔탈s(5.6.12.13)",
         "배추김치(9)",
     ]
+
+
+def test_week_endpoint_returns_dated_menus(client):
+    rows = [
+        {"date": "20261029", "meal_code": "2", "menu": "- 밥", "cal_info": "700 Kcal"}
+    ]
+    with patch(
+        "app.routers.meal._get_week", new_callable=AsyncMock, return_value=rows
+    ) as get_week:
+        response = client.get("/meal/week?date=20261029")
+
+    assert response.status_code == 200
+    assert response.json() == {"week_start": "20261026", "meals": rows}
+    get_week.assert_awaited_once_with(
+        datetime(2026, 10, 26, tzinfo=ZoneInfo("Asia/Seoul"))
+    )
+
+
+def test_week_endpoint_accepts_next_year_for_year_end_warmup(client):
+    with patch("app.routers.meal._get_week", new_callable=AsyncMock, return_value=[]):
+        response = client.get("/meal/week?date=20270104")
+    assert response.json() == {"week_start": "20270104", "meals": []}
+
+
+def test_week_endpoint_rejects_invalid_calendar_dates(client):
+    with patch("app.routers.meal._get_week", new_callable=AsyncMock) as get_week:
+        response = client.get("/meal/week?date=20260230")
+    assert "error" in response.json()
+    get_week.assert_not_awaited()
+
+
+@pytest.mark.parametrize("path", ["/meal/", "/meal/week?date=20261029"])
+def test_outage_is_not_reported_or_cached_as_no_meal(client, path):
+    with (
+        patch(
+            "app.routers.meal._fetch_meals",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("NEIS offline"),
+        ),
+        patch(
+            "app.routers.meal._fetch_meals_from_school",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("school offline"),
+        ),
+        patch("app.routers.meal.cache.set", new_callable=AsyncMock) as cache_set,
+    ):
+        data = client.get(path).json()
+    assert "error" in data
+    assert data["menu"] != "급식이 없습니다."
+    cache_set.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_school_fallback_recovers_from_a_neis_exception():
+    rows = [{"MLSV_YMD": "20261029", "MMEAL_SC_CODE": "2", "DDISH_NM": "밥"}]
+    with (
+        patch(
+            "app.routers.meal._fetch_meals",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("offline"),
+        ),
+        patch(
+            "app.routers.meal._fetch_meals_from_school",
+            new_callable=AsyncMock,
+            return_value=rows,
+        ),
+    ):
+        result = await meal._load_week(datetime(2026, 10, 26))
+    assert result == [
+        {"date": "20261029", "meal_code": "2", "menu": "- 밥", "cal_info": ""}
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code,is_empty", [("INFO-200", True), ("ERROR-290", False)])
+async def test_neis_distinguishes_no_data_from_api_errors(code, is_empty):
+    response = MagicMock()
+    response.json = AsyncMock(return_value={"RESULT": {"CODE": code}})
+
+    @asynccontextmanager
+    async def request(*args, **kwargs):
+        yield response
+
+    with patch("app.routers.meal.request", request):
+        if is_empty:
+            assert await meal._fetch_meals("20261026", "20261101") == []
+        else:
+            with pytest.raises(RuntimeError):
+                await meal._fetch_meals("20261026", "20261101")
+
+
+@pytest.mark.asyncio
+async def test_broken_school_calendar_is_not_treated_as_no_meals():
+    response = MagicMock()
+    response.text = AsyncMock(return_value="<html>maintenance</html>")
+
+    @asynccontextmanager
+    async def request(*args, **kwargs):
+        yield response
+
+    with patch("app.routers.meal.request", request):
+        with pytest.raises(RuntimeError):
+            await meal._fetch_month_from_school(2026, 10)
+
+
+@pytest.mark.asyncio
+async def test_warmup_always_includes_next_week_before_sunday():
+    now = datetime(2026, 10, 29, 12, tzinfo=ZoneInfo("Asia/Seoul"))
+    with patch("app.routers.meal._get_week", new_callable=AsyncMock) as get_week:
+        await meal.warm_meal_cache(now)
+    assert get_week.await_args_list == [
+        call(datetime(2026, 10, 26, tzinfo=ZoneInfo("Asia/Seoul"))),
+        call(datetime(2026, 11, 2, tzinfo=ZoneInfo("Asia/Seoul"))),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_failed_pagination_does_not_return_a_partial_week():
+    response = MagicMock()
+    response.json = AsyncMock(
+        side_effect=[
+            {
+                "mealServiceDietInfo": [
+                    {"head": [{"list_total_count": 2}]},
+                    {"row": [{"MLSV_YMD": "20261026", "MMEAL_SC_CODE": "1"}]},
+                ]
+            },
+            RuntimeError("second page offline"),
+        ]
+    )
+
+    @asynccontextmanager
+    async def request(*args, **kwargs):
+        yield response
+
+    with patch("app.routers.meal.request", request):
+        with pytest.raises(RuntimeError, match="second page offline"):
+            await meal._fetch_meals("20261026", "20261101")
