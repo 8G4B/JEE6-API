@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import asyncio
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
@@ -298,3 +299,123 @@ async def test_failed_pagination_does_not_return_a_partial_week():
     with patch("app.routers.meal.request", request):
         with pytest.raises(RuntimeError, match="second page offline"):
             await meal._fetch_meals("20261026", "20261101")
+
+
+@pytest.mark.asyncio
+async def test_both_sources_start_immediately_and_neis_wins_a_tie():
+    rows = [{"MLSV_YMD": "20261029", "MMEAL_SC_CODE": "2", "DDISH_NM": "밥"}]
+    with (
+        patch.object(meal, "_fetch_meals", AsyncMock(return_value=rows)),
+        patch.object(
+            meal, "_fetch_meals_from_school", AsyncMock(return_value=[])
+        ) as school,
+    ):
+        assert (await meal._load_week(datetime(2026, 10, 26)))[0]["menu"] == "- 밥"
+    school.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("slow_source", ["neis", "school"])
+async def test_slow_source_does_not_block_the_other_source_and_is_cancelled(
+    slow_source,
+):
+    rows = [{"MLSV_YMD": "20261029", "MMEAL_SC_CODE": "2", "DDISH_NM": "밥"}]
+    school_started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def neis(*_):
+        if slow_source == "neis":
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+        await school_started.wait()
+        return rows
+
+    async def school(*_):
+        school_started.set()
+        if slow_source == "school":
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+        return rows
+
+    with (
+        patch.object(meal, "_fetch_meals", neis),
+        patch.object(meal, "_fetch_meals_from_school", school),
+    ):
+        result = await asyncio.wait_for(meal._load_week(datetime(2026, 10, 26)), 1)
+    assert result[0]["menu"] == "- 밥"
+    assert cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_empty_fallback_waits_for_the_populated_primary():
+    school_done = asyncio.Event()
+
+    async def school(*_):
+        school_done.set()
+        return []
+
+    async def neis(*_):
+        await school_done.wait()
+        return [{"MLSV_YMD": "20261029", "MMEAL_SC_CODE": "2", "DDISH_NM": "밥"}]
+
+    with (
+        patch.object(meal, "_fetch_meals", neis),
+        patch.object(meal, "_fetch_meals_from_school", school),
+    ):
+        assert (await meal._load_week(datetime(2026, 10, 26)))[0]["menu"] == "- 밥"
+
+
+@pytest.mark.asyncio
+async def test_two_cold_weeks_share_one_school_month_request(monkeypatch):
+    from app import cache
+
+    monkeypatch.setattr(cache, "pool", None)
+    cache._memory_cache.clear()
+    rows = [
+        {"MLSV_YMD": "20261019", "MMEAL_SC_CODE": "2", "DDISH_NM": "first week"},
+        {"MLSV_YMD": "20261026", "MMEAL_SC_CODE": "2", "DDISH_NM": "second week"},
+    ]
+    try:
+        with patch.object(
+            meal,
+            "_fetch_month_from_school",
+            AsyncMock(side_effect=lambda year, month: rows if month == 10 else []),
+        ) as fetch:
+            first, second = await asyncio.gather(
+                meal._fetch_meals_from_school("20261019", "20261025"),
+                meal._fetch_meals_from_school("20261026", "20261101"),
+            )
+        assert first == [rows[0]]
+        assert second == [rows[1]]
+        assert fetch.await_count == 2  # October once, November once
+        assert fetch.await_args_list.count(call(2026, 10)) == 1
+    finally:
+        cache._memory_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_cold_lookup_cleans_up_both_sources():
+    started = [asyncio.Event(), asyncio.Event()]
+    cancelled = [asyncio.Event(), asyncio.Event()]
+
+    async def load(index, *_):
+        started[index].set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled[index].set()
+
+    with (
+        patch.object(meal, "_fetch_meals", lambda *args: load(0, *args)),
+        patch.object(meal, "_fetch_meals_from_school", lambda *args: load(1, *args)),
+    ):
+        request = asyncio.create_task(meal._load_week(datetime(2026, 10, 26)))
+        await asyncio.gather(*(event.wait() for event in started))
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+    assert all(event.is_set() for event in cancelled)

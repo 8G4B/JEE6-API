@@ -169,7 +169,15 @@ async def _fetch_meals_from_school(from_ymd: str, to_ymd: str) -> list[dict]:
     months = {(from_dt.year, from_dt.month), (to_dt.year, to_dt.month)}
 
     results = await asyncio.gather(
-        *(_fetch_month_from_school(year, month) for year, month in sorted(months))
+        *(
+            cache.get_or_set(
+                f"meal:school:{year}{month:02d}",
+                lambda year=year, month=month: _fetch_month_from_school(year, month),
+                ttl=300,
+                negative_ttl=60,
+            )
+            for year, month in sorted(months)
+        )
     )
     rows = [row for result in results for row in result]
 
@@ -222,14 +230,39 @@ def _week_key(monday: datetime) -> str:
 async def _load_week(monday: datetime) -> list[dict]:
     from_ymd = monday.strftime("%Y%m%d")
     to_ymd = (monday + timedelta(days=6)).strftime("%Y%m%d")
+    primary = asyncio.create_task(_fetch_meals(from_ymd, to_ymd))
+    school = asyncio.create_task(_fetch_meals_from_school(from_ymd, to_ymd))
+    tasks = {primary, school}
     try:
-        rows = await _fetch_meals(from_ymd, to_ymd)
-    except Exception:
-        logger.warning("NEIS 조회 실패, 학교 급식 게시판으로 재시도합니다.")
-        rows = []
-    if not rows:
-        rows = await _fetch_meals_from_school(from_ymd, to_ymd)
-    return [_format_meal(row) for row in rows]
+        # Only cache misses reach here. Race both complete sources immediately
+        # so neither source's timeout delays a valid menu from the other.
+        pending = set(tasks)
+        empty = False
+        errors = []
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            # Prefer NEIS if both sources complete in the same loop iteration.
+            for task in sorted(done, key=lambda task: task is not primary):
+                try:
+                    rows = task.result()
+                except Exception as error:
+                    errors.append(error)
+                    continue
+                if rows:
+                    return [_format_meal(row) for row in rows]
+                empty = True
+        # Keep the previous contract: a failed school fallback is not evidence
+        # of no meals, even when NEIS returns an empty result.
+        if school.exception() is not None or not empty:
+            raise errors[-1]
+        return []
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def _get_week(monday: datetime) -> list[dict]:
